@@ -1,0 +1,373 @@
+import asyncio
+import os
+import locale
+import shutil
+import tempfile
+import zipfile
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Callable
+
+try:
+    from textual.app import App, ComposeResult
+    from textual.containers import Container, Horizontal
+    from textual.widgets import Header, Footer, DataTable, Static, Input, Button, ProgressBar
+    from textual.reactive import reactive
+    from textual.screen import ModalScreen
+except ImportError as e:
+    raise ImportError(
+        "textual is required for the terminal UI. "
+        "Install with: pip install textual"
+    ) from e
+
+try:
+    from pypdf import PdfReader, PdfWriter
+except ImportError:
+    PdfReader = None
+    PdfWriter = None
+
+try:
+    from docx import Document
+except ImportError:
+    Document = None
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+
+IMAGE_EXT = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".gif"}
+PDF_EXT = {".pdf"}
+DOCX_EXT = {".docx"}
+SUPPORTED_EXT = IMAGE_EXT | PDF_EXT | DOCX_EXT
+
+SCRUBBERS: Dict[str, Callable[[str], None]] = {}
+
+
+def atomic_save(filepath: str, write_func: Callable[[str], None], suffix: Optional[str] = None) -> None:
+    fd, tmp_path = tempfile.mkstemp(suffix=suffix, dir=Path(filepath).parent)
+    try:
+        os.close(fd)
+        write_func(tmp_path)
+        shutil.move(tmp_path, filepath)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+
+
+def scrub_image(filepath: str) -> None:
+    img = Image.open(filepath)
+    fmt = img.format
+    clean_img = Image.new(img.mode, img.size)
+    clean_img.putdata(list(img.getdata()))
+    save_all = fmt == "GIF"
+    atomic_save(filepath, lambda p: clean_img.save(p, format=fmt, save_all=save_all), suffix=Path(filepath).suffix)
+
+
+def scrub_pdf(filepath: str) -> None:
+    if PdfWriter is None:
+        raise ImportError("pypdf is required for PDF scrubbing. Install with: pip install pypdf")
+
+    def writer(p: str) -> None:
+        reader = PdfReader(filepath)
+        writer = PdfWriter()
+        for page in reader.pages:
+            writer.add_page(page)
+        writer.add_metadata({})
+        with open(p, "wb") as f:
+            writer.write(f)
+
+    atomic_save(filepath, writer, suffix=".pdf")
+
+
+def scrub_docx(filepath: str) -> None:
+    if Document is None:
+        raise ImportError("python-docx is required for DOCX scrubbing. Install with: pip install python-docx")
+    doc = Document(filepath)
+    cp = doc.core_properties
+    cp.author = ""
+    cp.category = ""
+    cp.comments = ""
+    cp.content_status = ""
+    cp.created = None
+    cp.identifier = ""
+    cp.keywords = ""
+    cp.language = ""
+    cp.last_modified_by = ""
+    cp.last_printed = None
+    cp.modified = None
+    cp.revision = ""
+    cp.subject = ""
+    cp.title = ""
+    cp.version = ""
+
+    def writer(p: str) -> None:
+        doc.save(p)
+        with zipfile.ZipFile(p, "r") as zin:
+            items = [(name, zin.read(name)) for name in zin.namelist()]
+        with zipfile.ZipFile(p, "w", zipfile.ZIP_DEFLATED) as zout:
+            for name, content in items:
+                if name == "docProps/app.xml":
+                    zout.writestr(
+                        name,
+                        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+                        "<Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties\"></Properties>",
+                    )
+                elif name == "docProps/custom.xml":
+                    zout.writestr(
+                        name,
+                        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+                        "<Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/custom-properties\"></Properties>",
+                    )
+                else:
+                    zout.writestr(name, content)
+
+    atomic_save(filepath, writer, suffix=".docx")
+
+
+for ext in IMAGE_EXT:
+    SCRUBBERS[ext] = scrub_image
+for ext in PDF_EXT:
+    SCRUBBERS[ext] = scrub_pdf
+if Document is not None:
+    for ext in DOCX_EXT:
+        SCRUBBERS[ext] = scrub_docx
+
+
+def get_files(directory: str) -> List[str]:
+    active_ext = IMAGE_EXT | PDF_EXT
+    if Document is not None:
+        active_ext |= DOCX_EXT
+    files: List[str] = []
+    try:
+        with os.scandir(directory) as it:
+            for entry in it:
+                if entry.is_file() and Path(entry.name).suffix.lower() in active_ext:
+                    files.append(entry.path)
+    except OSError:
+        pass
+    return sorted(files)
+
+
+class DirectoryModal(ModalScreen):
+    BINDINGS = [
+        ("enter", "submit", "Submit"),
+        ("escape", "cancel", "Cancel"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Container():
+            yield Input(placeholder="Enter directory path", id="dir-input")
+            with Horizontal():
+                yield Button("OK", id="ok", variant="primary")
+                yield Button("Cancel", id="cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "ok":
+            self.dismiss(self.query_one("#dir-input").value)
+        else:
+            self.dismiss(None)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value)
+
+    def action_submit(self) -> None:
+        self.dismiss(self.query_one("#dir-input").value)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class ProgressModal(ModalScreen):
+    def compose(self) -> ComposeResult:
+        with Container():
+            yield Static("Scrubbing...", id="progress-title")
+            yield ProgressBar(id="progress-bar")
+            yield Static("", id="progress-text")
+
+    def update_progress(self, current: int, total: int, filename: str) -> None:
+        self.query_one("#progress-bar").total = total
+        self.query_one("#progress-bar").progress = current / total
+        self.query_one("#progress-text").update(f"{current}/{total} {filename}")
+
+
+class MetadataScrubberApp(App):
+    CSS = """
+    Screen {
+        layout: vertical;
+    }
+    DataTable {
+        height: 1fr;
+    }
+    #status {
+        height: 3;
+        content-align: center middle;
+        background: $panel;
+        text-style: bold;
+    }
+    DirectoryModal {
+        align: center middle;
+    }
+    DirectoryModal > Container {
+        width: 60;
+        height: 11;
+        border: thick $primary;
+        background: $surface;
+        padding: 1;
+    }
+    ProgressModal {
+        align: center middle;
+    }
+    ProgressModal > Container {
+        width: 60;
+        height: 9;
+        border: thick $primary;
+        background: $surface;
+        padding: 1;
+    }
+    """
+
+    BINDINGS = [
+        ("space", "toggle_select", "Toggle"),
+        ("a", "select_all", "All"),
+        ("d", "deselect_all", "None"),
+        ("enter", "scrub", "Scrub"),
+        ("c", "change_dir", "Dir"),
+        ("h", "help", "Help"),
+        ("q", "quit", "Quit"),
+    ]
+
+    current_dir: reactive[str] = reactive("")
+    files: reactive[List[str]] = reactive([])
+    selected: reactive[Set[int]] = reactive(set())
+    message: reactive[str] = reactive("Ready")
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield DataTable(id="file-table")
+        yield Static("Ready", id="status", markup=True)
+        yield Footer()
+
+    def on_mount(self):
+        self.current_dir = os.getcwd()
+        self.load_files()
+        table = self.query_one("#file-table")
+        table.cursor_type = "row"
+        table.add_column("", key="sel", width=4)
+        table.add_column("File", key="name")
+
+    def load_files(self):
+        self.files = get_files(self.current_dir)
+        self.selected.clear()
+        self.update_table()
+        self.message = f"Loaded {len(self.files)} files from {self.current_dir}"
+
+    def update_table(self):
+        table = self.query_one("#file-table")
+        table.clear(columns=False)
+        for i, f in enumerate(self.files):
+            table.add_row(
+                "[X]" if i in self.selected else "[ ]",
+                os.path.basename(f),
+                key=str(i),
+            )
+        if self.files:
+            table.move_cursor(row=0)
+
+    def update_selection_display(self):
+        if not self.files:
+            return
+        table = self.query_one("#file-table")
+        for i in range(len(self.files)):
+            table.update_cell(
+                row=i,
+                column_key="sel",
+                value="[X]" if i in self.selected else "[ ]",
+            )
+
+    def action_toggle_select(self):
+        table = self.query_one("#file-table")
+        row = table.cursor_row
+        if 0 <= row < len(self.files):
+            if row in self.selected:
+                self.selected.remove(row)
+            else:
+                self.selected.add(row)
+            self.update_selection_display()
+
+    def action_select_all(self):
+        self.selected = set(range(len(self.files)))
+        self.update_selection_display()
+        self.message = "All files selected"
+
+    def action_deselect_all(self):
+        self.selected.clear()
+        self.update_selection_display()
+        self.message = "Selection cleared"
+
+    def action_scrub(self):
+        if not self.selected:
+            self.message = "No files selected"
+            return
+        self.scrub_selected()
+
+    def action_change_dir(self):
+        self.push_screen(DirectoryModal(), self.on_directory_selected)
+
+    def action_help(self):
+        self.message = "SPACE:Toggle a:All d:None ENTER:Scrub c:Dir h:Help q:Quit"
+
+    def on_directory_selected(self, new_dir: Optional[str]):
+        if new_dir:
+            new_dir = os.path.expanduser(new_dir.strip())
+            if os.path.isdir(new_dir):
+                self.current_dir = new_dir
+                self.load_files()
+                self.message = f"Changed to {new_dir}"
+            else:
+                self.message = f"Not a directory: {new_dir}"
+        else:
+            self.message = "Directory change cancelled"
+
+    def scrub_selected(self):
+        to_process = [self.files[i] for i in sorted(self.selected)]
+        total = len(to_process)
+        progress_modal = ProgressModal()
+
+        async def do_scrub():
+            self.push_screen(progress_modal)
+            success = 0
+            fail = 0
+            for idx, filepath in enumerate(to_process, start=1):
+                progress_modal.update_progress(idx, total, os.path.basename(filepath))
+                await asyncio.sleep(0)
+                try:
+                    scrubber = SCRUBBERS.get(Path(filepath).suffix.lower())
+                    if scrubber:
+                        scrubber(filepath)
+                        success += 1
+                    else:
+                        raise ValueError("Unsupported extension")
+                except Exception as e:
+                    fail += 1
+                    self.message = f"Failed: {os.path.basename(filepath)} ({e})"
+                    self.refresh()
+                    await asyncio.sleep(0)
+            self.pop_screen()
+            self.message = f"Done: {success} succeeded, {fail} failed"
+            self.selected.clear()
+            self.load_files()
+
+        asyncio.create_task(do_scrub())
+
+
+def main() -> None:
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error:
+        pass
+    MetadataScrubberApp().run()
+
+
+if __name__ == "__main__":
+    main()
