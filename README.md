@@ -1,5 +1,7 @@
 A modern terminal-based metadata scrubber for images, PDFs, and DOCX files. Frewsh removes hidden metadata (EXIF, document info, author tags, etc.) through an interactive TUI built with Textual, featuring atomic writes to prevent data loss.
 
+<img width="1876" height="967" alt="image" src="https://github.com/user-attachments/assets/6107eee8-470e-40e3-8a84-c7d50d91f577" />
+
 ## Features
 
 - **Modern TUI** — Interactive file browser built with Textual, featuring keyboard navigation and real-time status updates.
