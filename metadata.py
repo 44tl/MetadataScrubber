@@ -31,9 +31,10 @@ except ImportError:
     Document = None
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageSequence
 except ImportError:
     Image = None
+    ImageSequence = None
 
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".gif"}
 PDF_EXT = {".pdf"}
@@ -44,10 +45,12 @@ SCRUBBERS: Dict[str, Callable[[str], None]] = {}
 
 
 def atomic_save(filepath: str, write_func: Callable[[str], None], suffix: Optional[str] = None) -> None:
+    original_mode = os.stat(filepath).st_mode
     fd, tmp_path = tempfile.mkstemp(suffix=suffix, dir=Path(filepath).parent)
     try:
         os.close(fd)
         write_func(tmp_path)
+        os.chmod(tmp_path, original_mode)
         shutil.move(tmp_path, filepath)
     except Exception:
         if os.path.exists(tmp_path):
@@ -58,26 +61,52 @@ def atomic_save(filepath: str, write_func: Callable[[str], None], suffix: Option
 def scrub_image(filepath: str) -> None:
     img = Image.open(filepath)
     fmt = img.format
-    clean_img = Image.new(img.mode, img.size)
-    clean_img.putdata(list(img.getdata()))
-    save_all = fmt == "GIF"
-    atomic_save(filepath, lambda p: clean_img.save(p, format=fmt, save_all=save_all), suffix=Path(filepath).suffix)
+    is_animated = fmt == "GIF" and getattr(img, "n_frames", 1) > 1
+
+    if is_animated:
+        frames = []
+        durations = []
+        for frame in ImageSequence.Iterator(img):
+            clean = Image.new(frame.mode, frame.size)
+            clean.putdata(list(frame.getdata()))
+            frames.append(clean)
+            durations.append(frame.info.get("duration", 0))
+        loop = img.info.get("loop", 0)
+
+        def write(p: str) -> None:
+            frames[0].save(
+                p,
+                format=fmt,
+                save_all=True,
+                append_images=frames[1:],
+                duration=durations,
+                loop=loop,
+                disposal=2,
+            )
+    else:
+        clean_img = Image.new(img.mode, img.size)
+        clean_img.putdata(list(img.getdata()))
+
+        def write(p: str) -> None:
+            clean_img.save(p, format=fmt)
+
+    atomic_save(filepath, write, suffix=Path(filepath).suffix)
 
 
 def scrub_pdf(filepath: str) -> None:
     if PdfWriter is None:
         raise ImportError("pypdf is required for PDF scrubbing. Install with: pip install pypdf")
 
-    def writer(p: str) -> None:
+    def write(p: str) -> None:
         reader = PdfReader(filepath)
-        writer = PdfWriter()
+        pdf_writer = PdfWriter()
         for page in reader.pages:
-            writer.add_page(page)
-        writer.add_metadata({})
+            pdf_writer.add_page(page)
+        pdf_writer.add_metadata({})
         with open(p, "wb") as f:
-            writer.write(f)
+            pdf_writer.write(f)
 
-    atomic_save(filepath, writer, suffix=".pdf")
+    atomic_save(filepath, write, suffix=".pdf")
 
 
 def scrub_docx(filepath: str) -> None:
@@ -101,7 +130,7 @@ def scrub_docx(filepath: str) -> None:
     cp.title = ""
     cp.version = ""
 
-    def writer(p: str) -> None:
+    def write(p: str) -> None:
         doc.save(p)
         with zipfile.ZipFile(p, "r") as zin:
             items = [(name, zin.read(name)) for name in zin.namelist()]
@@ -122,27 +151,26 @@ def scrub_docx(filepath: str) -> None:
                 else:
                     zout.writestr(name, content)
 
-    atomic_save(filepath, writer, suffix=".docx")
+    atomic_save(filepath, write, suffix=".docx")
 
 
-for ext in IMAGE_EXT:
-    SCRUBBERS[ext] = scrub_image
-for ext in PDF_EXT:
-    SCRUBBERS[ext] = scrub_pdf
+if Image is not None:
+    for ext in IMAGE_EXT:
+        SCRUBBERS[ext] = scrub_image
+if PdfWriter is not None:
+    for ext in PDF_EXT:
+        SCRUBBERS[ext] = scrub_pdf
 if Document is not None:
     for ext in DOCX_EXT:
         SCRUBBERS[ext] = scrub_docx
 
 
 def get_files(directory: str) -> List[str]:
-    active_ext = IMAGE_EXT | PDF_EXT
-    if Document is not None:
-        active_ext |= DOCX_EXT
     files: List[str] = []
     try:
         with os.scandir(directory) as it:
             for entry in it:
-                if entry.is_file() and Path(entry.name).suffix.lower() in active_ext:
+                if entry.is_file() and Path(entry.name).suffix.lower() in SUPPORTED_EXT:
                     files.append(entry.path)
     except OSError:
         pass
@@ -178,12 +206,40 @@ class DirectoryModal(ModalScreen):
         self.dismiss(None)
 
 
+class ConfirmModal(ModalScreen):
+    BINDINGS = [
+        ("y", "confirm", "Yes"),
+        ("n", "cancel", "No"),
+        ("escape", "cancel", "Cancel"),
+    ]
+
+    def __init__(self, count: int) -> None:
+        super().__init__()
+        self.count = count
+
+    def compose(self) -> ComposeResult:
+        with Container():
+            yield Static(f"Scrub {self.count} file(s)? This cannot be undone.", id="confirm-text", markup=False)
+            with Horizontal():
+                yield Button("Yes", id="yes", variant="primary")
+                yield Button("No", id="no")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "yes")
+
+    def action_confirm(self) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
 class ProgressModal(ModalScreen):
     def compose(self) -> ComposeResult:
         with Container():
             yield Static("Scrubbing...", id="progress-title")
             yield ProgressBar(id="progress-bar")
-            yield Static("", id="progress-text")
+            yield Static("", id="progress-text", markup=False)
 
     def update_progress(self, current: int, total: int, filename: str) -> None:
         self.query_one("#progress-bar").total = total
@@ -205,7 +261,7 @@ class MetadataScrubberApp(App):
         background: $panel;
         text-style: bold;
     }
-    DirectoryModal {
+    DirectoryModal, ConfirmModal, ProgressModal {
         align: center middle;
     }
     DirectoryModal > Container {
@@ -215,8 +271,12 @@ class MetadataScrubberApp(App):
         background: $surface;
         padding: 1;
     }
-    ProgressModal {
-        align: center middle;
+    ConfirmModal > Container {
+        width: 60;
+        height: 9;
+        border: thick $warning;
+        background: $surface;
+        padding: 1;
     }
     ProgressModal > Container {
         width: 60;
@@ -245,7 +305,7 @@ class MetadataScrubberApp(App):
     def compose(self) -> ComposeResult:
         yield Header()
         yield DataTable(id="file-table")
-        yield Static("Ready", id="status", markup=True)
+        yield Static("Ready", id="status", markup=False)
         yield Footer()
 
     def on_mount(self):
@@ -255,6 +315,9 @@ class MetadataScrubberApp(App):
         table.cursor_type = "row"
         table.add_column("", key="sel", width=4)
         table.add_column("File", key="name")
+
+    def watch_message(self, message: str) -> None:
+        self.query_one("#status", Static).update(message)
 
     def load_files(self):
         self.files = get_files(self.current_dir)
@@ -309,7 +372,7 @@ class MetadataScrubberApp(App):
         if not self.selected:
             self.message = "No files selected"
             return
-        self.scrub_selected()
+        self.push_screen(ConfirmModal(len(self.selected)), self.on_scrub_confirmed)
 
     def action_change_dir(self):
         self.push_screen(DirectoryModal(), self.on_directory_selected)
@@ -329,6 +392,12 @@ class MetadataScrubberApp(App):
         else:
             self.message = "Directory change cancelled"
 
+    def on_scrub_confirmed(self, confirmed: Optional[bool]) -> None:
+        if confirmed:
+            self.scrub_selected()
+        else:
+            self.message = "Scrub cancelled"
+
     def scrub_selected(self):
         to_process = [self.files[i] for i in sorted(self.selected)]
         total = len(to_process)
@@ -340,25 +409,23 @@ class MetadataScrubberApp(App):
             fail = 0
             for idx, filepath in enumerate(to_process, start=1):
                 progress_modal.update_progress(idx, total, os.path.basename(filepath))
-                await asyncio.sleep(0)
                 try:
-                    scrubber = SCRUBBERS.get(Path(filepath).suffix.lower())
-                    if scrubber:
-                        scrubber(filepath)
-                        success += 1
-                    else:
-                        raise ValueError("Unsupported extension")
+                    ext = Path(filepath).suffix.lower()
+                    scrubber = SCRUBBERS.get(ext)
+                    if scrubber is None:
+                        raise ValueError(f"no scrubber available for {ext}")
+                    await asyncio.to_thread(scrubber, filepath)
+                    success += 1
                 except Exception as e:
                     fail += 1
                     self.message = f"Failed: {os.path.basename(filepath)} ({e})"
-                    self.refresh()
                     await asyncio.sleep(0)
             self.pop_screen()
             self.message = f"Done: {success} succeeded, {fail} failed"
             self.selected.clear()
             self.load_files()
 
-        asyncio.create_task(do_scrub())
+        self.run_worker(do_scrub())
 
 
 def main() -> None:
