@@ -1,4 +1,4 @@
-# Fresh
+# MetadataScrubber [ Version 1.1 Freshly ]
 
 A terminal-based metadata scrubber for images, PDFs, and DOCX files. Fresh removes hidden metadata (EXIF, document info, author tags, etc.) through an interactive TUI built with Textual, using atomic writes to prevent data loss.
 
