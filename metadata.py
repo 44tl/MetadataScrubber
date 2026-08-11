@@ -1,7 +1,8 @@
+#!/usr/bin/env python3
+import argparse
 import asyncio
 import os
 import locale
-import shutil
 import tempfile
 import zipfile
 from pathlib import Path
@@ -40,8 +41,36 @@ IMAGE_EXT = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".gif"}
 PDF_EXT = {".pdf"}
 DOCX_EXT = {".docx"}
 SUPPORTED_EXT = IMAGE_EXT | PDF_EXT | DOCX_EXT
+EXT_TYPE = {ext: "Image" for ext in IMAGE_EXT}
+EXT_TYPE.update({".pdf": "PDF", ".docx": "Word"})
+EXT_REQUIREMENTS = {
+    **{ext: "pillow" for ext in IMAGE_EXT},
+    ".pdf": "pypdf",
+    ".docx": "python-docx",
+}
 
 SCRUBBERS: Dict[str, Callable[[str], None]] = {}
+
+
+def missing_packages() -> List[str]:
+    return sorted({pkg for ext, pkg in EXT_REQUIREMENTS.items() if ext not in SCRUBBERS})
+
+
+def file_type_label(filepath: str) -> str:
+    ext = Path(filepath).suffix.lower()
+    label = EXT_TYPE.get(ext, ext.lstrip("."))
+    if ext not in SCRUBBERS:
+        requirement = EXT_REQUIREMENTS.get(ext, "required package")
+        return f"{label} (missing {requirement})"
+    return label
+
+
+def file_status_label(filepath: str) -> str:
+    ext = Path(filepath).suffix.lower()
+    if ext in SCRUBBERS:
+        return "Ready"
+    requirement = EXT_REQUIREMENTS.get(ext, "package")
+    return f"Missing {requirement}"
 
 
 def atomic_save(filepath: str, write_func: Callable[[str], None], suffix: Optional[str] = None) -> None:
@@ -51,7 +80,7 @@ def atomic_save(filepath: str, write_func: Callable[[str], None], suffix: Option
         os.close(fd)
         write_func(tmp_path)
         os.chmod(tmp_path, original_mode)
-        shutil.move(tmp_path, filepath)
+        os.replace(tmp_path, filepath)
     except Exception:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
@@ -59,36 +88,36 @@ def atomic_save(filepath: str, write_func: Callable[[str], None], suffix: Option
 
 
 def scrub_image(filepath: str) -> None:
-    img = Image.open(filepath)
-    fmt = img.format
-    is_animated = fmt == "GIF" and getattr(img, "n_frames", 1) > 1
+    with Image.open(filepath) as img:
+        fmt = img.format
+        is_animated = fmt == "GIF" and getattr(img, "n_frames", 1) > 1
 
-    if is_animated:
-        frames = []
-        durations = []
-        for frame in ImageSequence.Iterator(img):
-            clean = Image.new(frame.mode, frame.size)
-            clean.putdata(list(frame.getdata()))
-            frames.append(clean)
-            durations.append(frame.info.get("duration", 0))
-        loop = img.info.get("loop", 0)
+        if is_animated:
+            frames = []
+            durations = []
+            for frame in ImageSequence.Iterator(img):
+                clean = Image.new(frame.mode, frame.size)
+                clean.putdata(list(frame.getdata()))
+                frames.append(clean)
+                durations.append(frame.info.get("duration", 0))
+            loop = img.info.get("loop", 0)
 
-        def write(p: str) -> None:
-            frames[0].save(
-                p,
-                format=fmt,
-                save_all=True,
-                append_images=frames[1:],
-                duration=durations,
-                loop=loop,
-                disposal=2,
-            )
-    else:
-        clean_img = Image.new(img.mode, img.size)
-        clean_img.putdata(list(img.getdata()))
+            def write(p: str) -> None:
+                frames[0].save(
+                    p,
+                    format=fmt,
+                    save_all=True,
+                    append_images=frames[1:],
+                    duration=durations,
+                    loop=loop,
+                    disposal=2,
+                )
+        else:
+            clean_img = Image.new(img.mode, img.size)
+            clean_img.putdata(list(img.getdata()))
 
-        def write(p: str) -> None:
-            clean_img.save(p, format=fmt)
+            def write(p: str) -> None:
+                clean_img.save(p, format=fmt)
 
     atomic_save(filepath, write, suffix=Path(filepath).suffix)
 
@@ -170,10 +199,14 @@ def get_files(directory: str) -> List[str]:
     try:
         with os.scandir(directory) as it:
             for entry in it:
-                if entry.is_file() and Path(entry.name).suffix.lower() in SUPPORTED_EXT:
-                    files.append(entry.path)
-    except OSError:
-        pass
+                if not entry.is_file():
+                    continue
+                ext = Path(entry.name).suffix.lower()
+                if ext not in SUPPORTED_EXT:
+                    continue
+                files.append(entry.path)
+    except OSError as exc:
+        raise RuntimeError(f"cannot access directory: {directory}") from exc
     return sorted(files)
 
 
@@ -264,23 +297,11 @@ class MetadataScrubberApp(App):
     DirectoryModal, ConfirmModal, ProgressModal {
         align: center middle;
     }
-    DirectoryModal > Container {
-        width: 60;
-        height: 11;
-        border: thick $primary;
-        background: $surface;
-        padding: 1;
-    }
-    ConfirmModal > Container {
-        width: 60;
-        height: 9;
-        border: thick $warning;
-        background: $surface;
-        padding: 1;
-    }
+    DirectoryModal > Container,
+    ConfirmModal > Container,
     ProgressModal > Container {
-        width: 60;
-        height: 9;
+        width: 70;
+        height: auto;
         border: thick $primary;
         background: $surface;
         padding: 1;
@@ -292,6 +313,8 @@ class MetadataScrubberApp(App):
         ("a", "select_all", "All"),
         ("d", "deselect_all", "None"),
         ("enter", "scrub", "Scrub"),
+        ("s", "scrub_all", "Scrub All"),
+        ("r", "reload", "Reload"),
         ("c", "change_dir", "Dir"),
         ("h", "help", "Help"),
         ("q", "quit", "Quit"),
@@ -302,19 +325,27 @@ class MetadataScrubberApp(App):
     selected: reactive[Set[int]] = reactive(set())
     message: reactive[str] = reactive("Ready")
 
+    def __init__(self, start_dir: str = "", **kwargs):
+        super().__init__(**kwargs)
+        self.start_dir = start_dir
+
     def compose(self) -> ComposeResult:
         yield Header()
+        yield Static("", id="info", markup=False)
         yield DataTable(id="file-table")
+        yield Static("", id="preview", markup=False)
         yield Static("Ready", id="status", markup=False)
         yield Footer()
 
     def on_mount(self):
-        self.current_dir = os.getcwd()
+        self.current_dir = self.start_dir or os.getcwd()
         self.load_files()
         table = self.query_one("#file-table")
         table.cursor_type = "row"
         table.add_column("", key="sel", width=4)
-        table.add_column("File", key="name")
+        table.add_column("File", key="name", width=40)
+        table.add_column("Type", key="type", width=16)
+        table.add_column("Status", key="status", width=12)
 
     def watch_message(self, message: str) -> None:
         self.query_one("#status", Static).update(message)
@@ -323,7 +354,17 @@ class MetadataScrubberApp(App):
         self.files = get_files(self.current_dir)
         self.selected.clear()
         self.update_table()
-        self.message = f"Loaded {len(self.files)} files from {self.current_dir}"
+        missing = missing_packages()
+        if missing:
+            self.message = f"{len(self.files)} files - missing: {', '.join(missing)}"
+        else:
+            self.message = f"Loaded {len(self.files)} files from {self.current_dir}"
+
+    def update_info(self) -> None:
+        info = self.query_one("#info", Static)
+        total = len(self.files)
+        selected = len(self.selected)
+        info.update(f"Directory: {self.current_dir} | Files: {total} | Selected: {selected}")
 
     def update_table(self):
         table = self.query_one("#file-table")
@@ -332,10 +373,13 @@ class MetadataScrubberApp(App):
             table.add_row(
                 "[X]" if i in self.selected else "[ ]",
                 os.path.basename(f),
+                file_type_label(f),
+                file_status_label(f),
                 key=str(i),
             )
         if self.files:
             table.move_cursor(row=0)
+        self.update_info()
 
     def update_selection_display(self):
         if not self.files:
@@ -343,10 +387,11 @@ class MetadataScrubberApp(App):
         table = self.query_one("#file-table")
         for i in range(len(self.files)):
             table.update_cell(
-                row=i,
+                row_key=str(i),
                 column_key="sel",
                 value="[X]" if i in self.selected else "[ ]",
             )
+        self.update_info()
 
     def action_toggle_select(self):
         table = self.query_one("#file-table")
@@ -374,11 +419,62 @@ class MetadataScrubberApp(App):
             return
         self.push_screen(ConfirmModal(len(self.selected)), self.on_scrub_confirmed)
 
+    def action_reload(self):
+        self.load_files()
+        self.message = "Directory reloaded"
+
+    def action_scrub_all(self):
+        if not self.files:
+            self.message = "No files to scrub"
+            return
+        self.selected = set(range(len(self.files)))
+        self.update_selection_display()
+        self.push_screen(ConfirmModal(len(self.files)), self.on_scrub_confirmed)
+
     def action_change_dir(self):
         self.push_screen(DirectoryModal(), self.on_directory_selected)
 
     def action_help(self):
-        self.message = "SPACE:Toggle a:All d:None ENTER:Scrub c:Dir h:Help q:Quit"
+        self.message = "SPACE toggle selection, ENTER scrub selected, S scrub all, A select all, D clear"
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        row_key = event.row_key
+        if hasattr(row_key, 'value'):
+            row_key = row_key.value
+        self.update_preview(int(row_key))
+
+    def update_preview(self, row_index: int) -> None:
+        preview = self.query_one("#preview", Static)
+        if row_index < 0 or row_index >= len(self.files):
+            preview.update("No file selected")
+            return
+        filepath = self.files[row_index]
+        ext = Path(filepath).suffix.lower()
+        if ext in IMAGE_EXT and Image is not None:
+            preview.update(self.render_image_preview(filepath))
+            return
+        preview.update(
+            f"{os.path.basename(filepath)}\n{file_type_label(filepath)}\n{file_status_label(filepath)}"
+        )
+
+    def render_image_preview(self, filepath: str) -> str:
+        try:
+            with Image.open(filepath) as img:
+                img = img.convert("L")
+                width = min(32, img.width)
+                height = min(12, max(1, int(width * img.height / img.width / 2)))
+                img = img.resize((width, height))
+                shades = "@%#*+=-:. "
+                lines = []
+                for y in range(height):
+                    row = ""
+                    for x in range(width):
+                        pixel = img.getpixel((x, y))
+                        row += shades[pixel * (len(shades) - 1) // 255]
+                    lines.append(row)
+                return "\n".join(lines)
+        except Exception as e:
+            return f"Could not render preview: {e}"
 
     def on_directory_selected(self, new_dir: Optional[str]):
         if new_dir:
@@ -429,11 +525,19 @@ class MetadataScrubberApp(App):
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Scrub metadata from images, PDFs, and DOCX files.")
+    parser.add_argument(
+        "directory",
+        nargs="?",
+        default=".",
+        help="directory to scan for supported files",
+    )
+    args = parser.parse_args()
     try:
         locale.setlocale(locale.LC_ALL, "")
     except locale.Error:
         pass
-    MetadataScrubberApp().run()
+    MetadataScrubberApp(start_dir=os.path.abspath(args.directory)).run()
 
 
 if __name__ == "__main__":
