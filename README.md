@@ -12,6 +12,10 @@ A terminal-based metadata scrubber for images, PDFs, and DOCX files. Fresh remov
 - Confirmation before overwriting files.
 - Minimal dependencies.
 
+## Changelog
+
+See the latest updates and release notes in the [Changelog](changelog.md)
+
 ## Supported Formats
 
 | Type  | Extensions |
