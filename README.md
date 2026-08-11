@@ -1,5 +1,7 @@
 # MetadataScrubber
 
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/e5aee62d-9a0e-4b26-9b67-2df93f166b28" />
+
 A terminal-based metadata scrubber for images, PDFs, and DOCX files. Fresh removes hidden metadata from files through an interactive TUI built with Textual.
 
 ## Features
