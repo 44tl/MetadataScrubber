@@ -1,17 +1,14 @@
-# MetadataScrubber [ Version 1.1 Freshly ]
+# MetadataScrubber
 
-A terminal-based metadata scrubber for images, PDFs, and DOCX files. Fresh removes hidden metadata (EXIF, document info, author tags, etc.) through an interactive TUI built with Textual, using atomic writes to prevent data loss.
-
-<img width="1876" height="967" alt="image" src="https://github.com/user-attachments/assets/6107eee8-470e-40e3-8a84-c7d50d91f577" />
+A terminal-based metadata scrubber for images, PDFs, and DOCX files. Fresh removes hidden metadata from files through an interactive TUI built with Textual.
 
 ## Features
 
-- **Modern TUI**: interactive file browser built with Textual, with keyboard navigation and live status updates.
-- **Atomic writes**: files are written to a temporary location and atomically replaced, protecting against corruption on failure. Original file permissions are preserved.
-- **Non-blocking**: scrubbing runs off the UI thread, so the interface stays responsive on large files.
-- **Confirmation before scrubbing**: scrubbing overwrites files in place, so you're asked to confirm before it runs.
-- **Broad format support**: images (including animated GIFs, which keep their frames and timing), PDFs, and Word documents.
-- **Minimal dependencies**: built on Pillow, pypdf, and python-docx.
+- Interactive file browser with keyboard controls.
+- Atomic file writes to avoid corruption.
+- Scrubs images, PDFs, and Word documents.
+- Confirmation before overwriting files.
+- Minimal dependencies.
 
 ## Supported Formats
 
@@ -24,15 +21,23 @@ A terminal-based metadata scrubber for images, PDFs, and DOCX files. Fresh remov
 ## Installation
 
 ```bash
-pip install textual pillow pypdf python-docx
+pip3 install textual pillow pypdf python-docx
 ```
 
-> **Note:** `pillow`, `pypdf`, and `python-docx` are each optional independently. Files of a format whose library isn't installed are still listed, but attempting to scrub them fails with an error naming the missing package.
+The script runs on Linux and macOS with Python 3.9 or newer.
+
+> Note: `pillow`, `pypdf`, and `python-docx` are optional. If a required package is missing, supported files are listed but will fail with a message naming the missing package.
 
 ## Usage
 
 ```bash
 python metadata.py
+```
+
+To start in a specific directory:
+
+```bash
+python metadata.py /path/to/files
 ```
 
 ### Keyboard Shortcuts
